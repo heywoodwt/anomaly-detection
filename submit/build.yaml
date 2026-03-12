@@ -1,1 +1,172 @@
-# cloudformation solution goes here
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  DS5220 Data Project 1 - Event-driven anomaly detection pipeline.
+  Provisions EC2, S3, SNS, IAM, Security Group, and Elastic IP.
+
+Parameters:
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 key pair for SSH access
+
+  SSHLocation:
+    Type: String
+    Default: "98.124.196.77/32"
+    Description: CIDR block allowed to SSH into the instance (your IP/32)
+
+  LatestUbuntuAMI:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+    Description: Latest Ubuntu 24.04 LTS AMI via SSM Parameter Store
+
+Resources:
+
+  AppBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: SNSTopicPolicy
+    Properties:
+      NotificationConfiguration:
+        TopicConfigurations:
+          - Event: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: "raw/"
+                  - Name: suffix
+                    Value: ".csv"
+            Topic: !Ref SNSTopic
+
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: ds5220-dp1
+
+  # SNS Topic Policy
+  SNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref SNSTopic
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowS3Publish
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref SNSTopic
+
+  # SNS HTTP Subscription to the FastAPI /notify endpoint
+  SNSSubscription:
+    Type: AWS::SNS::Subscription
+    DependsOn: ElasticIPAssociation
+    Properties:
+      TopicArn: !Ref SNSTopic
+      Protocol: http
+      Endpoint: !Sub "http://${ElasticIP}:8000/notify"
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH from my IP and API from anywhere
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHLocation
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          CidrIp: "0.0.0.0/0"
+
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3BucketFullAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "s3:*"
+                Resource:
+                  - !Sub "arn:aws:s3:::${AppBucket}"
+                  - !Sub "arn:aws:s3:::${AppBucket}/*"
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2Role
+
+  AppInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: AppBucket
+    Properties:
+      ImageId: !Ref LatestUbuntuAMI
+      InstanceType: t3.micro
+      KeyName: !Ref KeyName
+      SecurityGroups:
+        - !Ref InstanceSecurityGroup
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 16
+            VolumeType: gp3
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+
+          export BUCKET_NAME='${AppBucket}'
+          echo "BUCKET_NAME='${AppBucket}'" >> /etc/environment
+
+          apt-get update -y
+          apt-get install -y git python3 python3-pip python3-venv
+
+          git clone https://github.com/heywoodwt/anomaly-detection.git /opt/anomaly-detection
+
+          python3 -m venv /opt/anomaly-detection/venv
+          /opt/anomaly-detection/venv/bin/pip install -r /opt/anomaly-detection/requirements.txt
+
+          touch /var/log/anomaly-detection.log
+          chmod 666 /var/log/anomaly-detection.log
+
+          cd /opt/anomaly-detection
+          /opt/anomaly-detection/venv/bin/fastapi run app.py --host 0.0.0.0 --port 8000 &
+
+  ElasticIP:
+    Type: AWS::EC2::EIP
+
+  ElasticIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      InstanceId: !Ref AppInstance
+      EIP: !Ref ElasticIP
+
+
+Outputs:
+  BucketName:
+    Description: S3 bucket for the anomaly detection pipeline
+    Value: !Ref AppBucket
+
+  ElasticIPAddress:
+    Description: Public IP address of the EC2 instance
+    Value: !Ref ElasticIP
+
+  APIEndpoint:
+    Description: Base URL for the FastAPI application
+    Value: !Sub "http://${ElasticIP}:8000"
+
+  SNSTopicArn:
+    Description: ARN of the SNS topic
+    Value: !Ref SNSTopic
